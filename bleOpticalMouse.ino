@@ -2,6 +2,8 @@
 #include <driver/rtc_io.h>
 #include <paw3205.h>
 #include <BleMouse.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 
 #define MOUSE_LEFTPIN  (14)
 #define MOUSE_MIDPIN  (12)
@@ -9,23 +11,29 @@
 #define MOUSE_FORWARDPIN  (4)
 #define MOUSE_BACKWARDPIN  (35)
 #define MOUSE_RESPIN  (34)
+#define ADC_VBAT  (33)
  
 
 static BleMouse bleMouse;
 static uint8_t setResolution = (uint8_t)PAW3205_1000DPI;
 static uint32_t lastAction = 0;
-volatile static uint32_t pin2detected = 0;
-volatile static uint32_t pin15detected = 0;
-volatile static uint8_t falling = 0;
 
-static void Scroll1_ISR(void);
-static void Scroll2_ISR(void);
+volatile static int32_t scroll = 0;
+static uint16_t adcArray[100];
+static uint8_t adcIndex = 0;
+static uint16_t vbat = 0;
+
+volatile uint8_t prevB;
+
+static void IRAM_ATTR Scroll1_ISR(void);
+static void IRAM_ATTR Scroll2_ISR(void);
 
 void setup() 
 {
-  uint8_t pinScroll1 = 0;
-  uint8_t pinScroll2 = 0;
-  //Serial.begin(115200); // Debug
+  
+  Serial.begin(115200); // Debug
+  //WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // used for AA batteries
+  analogSetAttenuation(ADC_2_5db);
   esp_sleep_wakeup_cause_t wakeup_reason;
   wakeup_reason = esp_sleep_get_wakeup_cause();
   //Serial.print("Mouse chip ID2: "); // Debug
@@ -47,40 +55,28 @@ void setup()
   //Serial.println(Paw3205Drv_GetProductID2());
   //Paw3205Drv_SetResolution(PAW3205_1000DPI);
   bleMouse.begin();
-  pinMode(15,INPUT_PULLUP);
   pinMode(MOUSE_LEFTPIN,INPUT_PULLUP);
   pinMode(MOUSE_RIGHTPIN,INPUT_PULLUP);
   pinMode(MOUSE_MIDPIN,INPUT_PULLUP);
   pinMode(MOUSE_FORWARDPIN,INPUT_PULLUP);
   pinMode(MOUSE_BACKWARDPIN,INPUT_PULLUP);
   pinMode(MOUSE_RESPIN,INPUT_PULLUP);
+  pinMode(15,INPUT_PULLUP);
   pinMode(2,INPUT_PULLUP);
-  pinScroll1 = digitalRead(2);
-  pinScroll2 = digitalRead(15);
-  if ((pinScroll1 != 0) && (pinScroll2 != 0))
-  {
-    attachInterrupt(2, Scroll1_ISR, FALLING);
-    attachInterrupt(15, Scroll2_ISR, FALLING);
-    falling = 1;
-  }
-  else if ((pinScroll1 == 0) && (pinScroll2 == 0))
-  {
-    attachInterrupt(2, Scroll1_ISR, RISING);
-    attachInterrupt(15, Scroll2_ISR, RISING);
-    falling = 0;
-  }
-  else
-  {
-      //Invalid state, lets try falling
-    attachInterrupt(2, Scroll1_ISR, FALLING);
-    attachInterrupt(15, Scroll2_ISR, FALLING);
-    falling = 1;
-  }
+  //pinScroll1 = digitalRead(2);
+  prevB = digitalRead(15);
+  
+  attachInterrupt(2, Scroll1_ISR, CHANGE);
+  attachInterrupt(15, Scroll2_ISR, CHANGE);
+  
   if((ESP_SLEEP_WAKEUP_EXT0 != wakeup_reason) && (ESP_SLEEP_WAKEUP_EXT1 != wakeup_reason))
   {
       Paw3205Drv_SetResolution(PAW3205_1000DPI);
   }
-  
+  for(uint8_t tmp = 0; tmp < (sizeof(adcArray)/sizeof(adcArray[0])); tmp++)
+  {
+    adcArray[tmp] = analogRead(ADC_VBAT);
+  }
 
 }
 
@@ -182,9 +178,19 @@ void loop()
             }
             lastPinm = pinm;
         }
+        if (0 != scroll)
+        {
+            bleMouse.move(0,0,scroll);
+            portDISABLE_INTERRUPTS();
+            scroll = 0;
+            portENABLE_INTERRUPTS();
+            lastAction = millis();
+        }
+        bleMouse.setBatteryLevel(map(vbat,3500u,4000u,0u,100u));
+        /*
         if ((0 != pin2detected) && (0 != pin15detected))
         {
-            portDISABLE_INTERRUPTS();
+            //portDISABLE_INTERRUPTS();
             if (pin2detected < pin15detected)
             {
                 // Scroll down
@@ -211,26 +217,27 @@ void loop()
             pin15detected = 0;
             if (1 == falling)
             {
-                detachInterrupt(2);
-                detachInterrupt(15);
+                //detachInterrupt(2);
+                //detachInterrupt(15);
                 attachInterrupt(2, Scroll1_ISR, RISING);
                 attachInterrupt(15, Scroll2_ISR, RISING);
                 falling = 0;
             }
             else
             {
-                detachInterrupt(2);
-                detachInterrupt(15);
+                //detachInterrupt(2);
+                //detachInterrupt(15);
                 attachInterrupt(2, Scroll1_ISR, FALLING);
                 attachInterrupt(15, Scroll2_ISR, FALLING);
                 falling = 1;
             }
-            portENABLE_INTERRUPTS();
+            //portENABLE_INTERRUPTS();
         }
+        */
     }
     if ((lastAction + 120000UL) < millis())
     {
-        Serial.println("Sleep");
+        //Serial.println("Sleep");
         bleMouse.end();
         delay(100);
         esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON); // Enable pullups
@@ -241,14 +248,51 @@ void loop()
         esp_deep_sleep_start();
     }
     Paw3205Drv_Main();
+    adcArray[adcIndex++] = analogRead(ADC_VBAT);
+    if (adcIndex >= (sizeof(adcArray)/sizeof(adcArray[0]))) adcIndex = 0;
+    uint32_t adcSum = 0;
+    for(uint8_t tmp = 0; tmp < (sizeof(adcArray)/sizeof(adcArray[0])); tmp++)
+    {
+      adcSum += adcArray[tmp];
+    }
+    vbat = map((adcSum / (sizeof(adcArray)/sizeof(adcArray[0]))),0u,4095u,0u,7700u);
+    Serial.println(vbat);
     delay(10);
 }
 
-static void Scroll1_ISR(void)
+static void IRAM_ATTR Scroll1_ISR(void)
 {
-  pin2detected = millis();
+    uint8_t pin2, pin15;
+    if(bleMouse.isConnected()) 
+    {
+        pin2 = digitalRead(2);
+        pin15 = digitalRead(15);
+        if (0 == pin2^prevB)
+        {
+            scroll++;
+        }
+        else
+        {
+            scroll--;
+        }
+        prevB = pin15;
+    }
 }
-static void Scroll2_ISR(void)
+static void IRAM_ATTR Scroll2_ISR(void)
 {
-  pin15detected = millis();
+    uint8_t pin2, pin15;
+    if(bleMouse.isConnected()) 
+    {
+        pin2 = digitalRead(2);
+        pin15 = digitalRead(15);
+        if (0 == pin2^prevB)
+        {
+            scroll++;
+        }
+        else
+        {
+            scroll--;
+        }
+        prevB = pin15;
+    }
 }
